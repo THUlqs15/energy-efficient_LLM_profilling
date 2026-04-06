@@ -1,0 +1,82 @@
+=== vLLM Batch Profiling Script ===
+Model: /home/ubuntu/lqs/L3
+Output: /home/ubuntu/lqs/profiling_data.jsonl
+GPU current clock: 1710 MHz
+Supported frequencies: 101, range [210, 1710] MHz
+Attempting frequencies: [210, 510, 810, 1110, 1410, 1710]
+
+Testing clock lock capability...
+  Requested 210 MHz -> actual 1710 MHz
+  Requested 1710 MHz -> actual 1710 MHz
+
+Note: GPU does not support user clock control on this system.
+All profiling will be done at 1710 MHz.
+The profiling logger will record actual GPU frequency per batch.
+Removed existing /home/ubuntu/lqs/profiling_data.jsonl
+
+[1/1] Target freq: 1710 MHz
+  Initializing vLLM LLM engine...
+INFO 04-06 23:29:42 [utils.py:233] non-default args: {'dtype': 'bfloat16', 'max_model_len': 2048, 'gpu_memory_utilization': 0.85, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/ubuntu/lqs/L3'}
+WARNING 04-06 23:29:42 [envs.py:1744] Unknown vLLM environment variable detected: VLLM_PROFILING
+WARNING 04-06 23:29:42 [envs.py:1744] Unknown vLLM environment variable detected: VLLM_PROFILING_OUTPUT
+INFO 04-06 23:29:42 [model.py:549] Resolved architecture: Qwen3ForCausalLM
+INFO 04-06 23:29:42 [model.py:1678] Using max model len 2048
+INFO 04-06 23:29:46 [scheduler.py:238] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 04-06 23:29:46 [vllm.py:790] Asynchronous scheduling is enabled.
+WARNING 04-06 23:29:46 [vllm.py:848] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 04-06 23:29:46 [vllm.py:859] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 04-06 23:29:48 [vllm.py:1025] Cudagraph is disabled under eager mode
+INFO 04-06 23:29:48 [compilation.py:290] Enabled custom fusions: norm_quant, act_quant
+(EngineCore pid=9221) INFO 04-06 23:29:49 [core.py:105] Initializing a V1 LLM engine (v0.19.0) with config: model='/home/ubuntu/lqs/L3', speculative_config=None, tokenizer='/home/ubuntu/lqs/L3', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=2048, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/home/ubuntu/lqs/L3, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_images_per_batch': 0, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore pid=9221) INFO 04-06 23:29:49 [parallel_state.py:1400] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://172.31.39.85:36529 backend=nccl
+(EngineCore pid=9221) INFO 04-06 23:29:49 [parallel_state.py:1716] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore pid=9221) INFO 04-06 23:29:50 [gpu_model_runner.py:4781] Starting to load model /home/ubuntu/lqs/L3...
+(EngineCore pid=9221) INFO 04-06 23:29:50 [cuda.py:334] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+(EngineCore pid=9221) INFO 04-06 23:29:50 [flash_attn.py:596] Using FlashAttention version 2
+(EngineCore pid=9221) INFO 04-06 23:29:52 [default_loader.py:384] Loading weights took 1.79 seconds
+(EngineCore pid=9221) INFO 04-06 23:29:53 [gpu_model_runner.py:4866] Model loading took 15.27 GiB memory and 2.289494 seconds
+(EngineCore pid=9221) INFO 04-06 23:29:56 [gpu_worker.py:436] Available KV cache memory: 2.58 GiB
+(EngineCore pid=9221) INFO 04-06 23:29:56 [kv_cache_utils.py:1319] GPU KV cache size: 18,816 tokens
+(EngineCore pid=9221) INFO 04-06 23:29:56 [kv_cache_utils.py:1324] Maximum concurrency for 2,048 tokens per request: 9.19x
+(EngineCore pid=9221) INFO 04-06 23:29:56 [core.py:283] init engine (profile, create kv cache, warmup model) took 3.07 seconds
+(EngineCore pid=9221) WARNING 04-06 23:29:56 [vllm.py:848] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+(EngineCore pid=9221) WARNING 04-06 23:29:56 [vllm.py:859] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+(EngineCore pid=9221) INFO 04-06 23:29:56 [vllm.py:1025] Cudagraph is disabled under eager mode
+(EngineCore pid=9221) INFO 04-06 23:30:45 [core.py:1210] Shutdown initiated (timeout=0)
+(EngineCore pid=9221) INFO 04-06 23:30:45 [core.py:1233] Shutdown complete
+  vLLM engine initialized OK
+  Session: freq=1710MHz
+    Phase 1: Pure prefill batches
+    Warning: batch gen failed: This model's maximum context length is 2048 tokens. However, you requested 0 output tokens and your prompt contains at least 2049 input tokens, for a total of at least 2049 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=2049)
+    Warning: batch gen failed: This model's maximum context length is 2048 tokens. However, you requested 0 output tokens and your prompt contains at least 2049 input tokens, for a total of at least 2049 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=2049)
+    Warning: batch gen failed: This model's maximum context length is 2048 tokens. However, you requested 0 output tokens and your prompt contains at least 2049 input tokens, for a total of at least 2049 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=2049)
+    Warning: batch gen failed: This model's maximum context length is 2048 tokens. However, you requested 0 output tokens and your prompt contains at least 2049 input tokens, for a total of at least 2049 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=2049)
+    Warning: batch gen failed: This model's maximum context length is 2048 tokens. However, you requested 0 output tokens and your prompt contains at least 2049 input tokens, for a total of at least 2049 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=2049)
+    Phase 1 done: 66 post-warmup records
+    Phase 2: Decode-heavy batches
+    Phase 2 done: 581 post-warmup records
+    Phase 3: Mixed batch configs
+  Session done: 581 post-warmup records
+
+=== Profiling Complete ===
+Total batch records collected: 581
+Total records in file: 596
+GPU frequencies seen: [1710]
+Total prefill requests across all batches: 207
+Total decode requests across all batches: 2800
+Wall time: min=57.06ms, max=1862.70ms, mean=77.56ms
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards:   0% Completed | 0/5 [00:00<?, ?it/s]
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards:  20% Completed | 1/5 [00:00<00:01,  2.39it/s]
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards:  40% Completed | 2/5 [00:00<00:01,  2.31it/s]
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards:  60% Completed | 3/5 [00:01<00:00,  2.31it/s]
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards:  80% Completed | 4/5 [00:01<00:00,  2.49it/s]
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards: 100% Completed | 5/5 [00:01<00:00,  3.28it/s]
+(EngineCore pid=9221) 
+Loading safetensors checkpoint shards: 100% Completed | 5/5 [00:01<00:00,  2.81it/s]
+(EngineCore pid=9221) 

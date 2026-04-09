@@ -195,9 +195,228 @@ Profiling is controlled by environment variables:
 
 ## Step 2: Run Profiling
 
-### Full Profiling Script
+### Recommended: LLMEngine-based Profiling (Captures Decode)
+
+**File**: `profiling_engine_script.py`
+
+This approach uses `LLMEngine.step()` directly to capture both prefill and decode batches. Unlike the high-level `generate()` API, this gives visibility into each scheduler step including decode iterations.
+
+```python
+#!/usr/bin/env python3
+"""
+LLMEngine-based Batch Latency Profiling Script for vLLM.
+Captures both prefill and decode batches via direct step() calls.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+def query_supported_gpu_clocks():
+    """Query all supported GPU graphics clock frequencies."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-q", "-d", "SUPPORTED_CLOCKS"],
+            capture_output=True, text=True, check=True,
+        )
+        freqs = []
+        for line in result.stdout.split("\n"):
+            if "Graphics" in line and "MHz" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    freq_str = parts[1].strip().split()[0]
+                    try:
+                        freqs.append(int(freq_str))
+                    except ValueError:
+                        pass
+        return sorted(set(freqs), reverse=True)
+    except Exception as e:
+        print(f"Error querying GPU clocks: {e}")
+        return []
+
+
+def select_representative_frequencies(all_freqs, num_freqs=8):
+    """Select representative frequencies spanning the full range."""
+    if len(all_freqs) <= num_freqs:
+        return all_freqs
+    percentiles = [0, 15, 30, 45, 60, 75, 90, 100]
+    selected_indices = [int(len(all_freqs) * p / 100) for p in percentiles]
+    selected_indices = [min(i, len(all_freqs) - 1) for i in selected_indices]
+    seen = set()
+    result = []
+    for freq in [all_freqs[i] for i in selected_indices]:
+        if freq not in seen:
+            seen.add(freq)
+            result.append(freq)
+    return result
+
+
+def lock_gpu_clock(freq_mhz):
+    """Lock GPU clock to specified frequency using sudo."""
+    try:
+        subprocess.run(
+            ["sudo", "nvidia-smi", "--lock-gpu-clocks", f"{freq_mhz},{freq_mhz}"],
+            check=True, capture_output=True,
+        )
+        print(f"  Locked GPU clock to {freq_mhz} MHz")
+        time.sleep(2)
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.gr", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True,
+        )
+        actual_freq = int(result.stdout.strip())
+        if abs(actual_freq - freq_mhz) > 100:
+            print(f"  Warning: Requested {freq_mhz} MHz but got {actual_freq} MHz")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  Error locking GPU clock: {e}")
+        return False
+
+
+def reset_gpu_clock():
+    """Reset GPU clock to default using sudo."""
+    try:
+        subprocess.run(["sudo", "nvidia-smi", "--reset-gpu-clocks"],
+                      check=True, capture_output=True)
+        print("  Reset GPU clock to default")
+    except Exception as e:
+        print(f"  Error resetting GPU clock: {e}")
+
+
+def generate_prompts_for_workload(workload_type, num_requests, prompt_lengths, max_tokens):
+    """Generate prompts for different workload types."""
+    prompts = []
+    rng = np.random.default_rng(42)
+
+    for i in range(num_requests):
+        prompt_len = int(rng.choice(prompt_lengths))
+        words = ["The", "quick", "brown", "fox", "jumps", "over", "the", "lazy", "dog."]
+        num_repeats = max(1, prompt_len // len(words))
+        prompt = " ".join(words * num_repeats)
+
+        if workload_type == "prefill_heavy":
+            tokens = int(rng.integers(1, 10))
+        elif workload_type == "decode_heavy":
+            tokens = max_tokens
+        else:  # mixed
+            tokens = int(rng.integers(10, max_tokens))
+
+        prompts.append((prompt, tokens))
+
+    return prompts
+
+
+def profile_with_engine(model_path, output_file, num_requests_per_batch=8,
+                       prompt_lengths=[64, 128, 256, 512],
+                       max_tokens_range=[20, 50, 100],
+                       num_iterations=100, warmup_iterations=20):
+    """Profile using LLMEngine directly with step() to capture decode batches."""
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.engine.llm_engine import LLMEngine
+    from vllm.sampling_params import SamplingParams
+    from vllm import profiling_logger
+
+    print(f"  Initializing LLMEngine with model: {model_path}")
+
+    engine_args = EngineArgs(
+        model=model_path,
+        max_model_len=4096,
+        max_num_seqs=64,
+        enforce_eager=True,
+        gpu_memory_utilization=0.9,
+        enable_chunked_prefill=True,
+    )
+
+    engine = LLMEngine.from_engine_args(engine_args)
+    profiling_logger.reset_batch_counter()
+
+    rng = np.random.default_rng(42)
+    total_steps = 0
+    request_id_counter = 0
+
+    for iteration in range(num_iterations + warmup_iterations):
+        is_warmup = iteration < warmup_iterations
+
+        # Vary workload type
+        if iteration % 3 == 0:
+            workload_type = "prefill_heavy"
+        elif iteration % 3 == 1:
+            workload_type = "decode_heavy"
+        else:
+            workload_type = "mixed"
+
+        num_reqs = int(rng.integers(1, num_requests_per_batch + 1))
+        max_tokens = int(rng.choice(max_tokens_range))
+        prompts = generate_prompts_for_workload(
+            workload_type, num_reqs, prompt_lengths, max_tokens
+        )
+
+        for prompt, tokens in prompts:
+            request_id = f"req-{request_id_counter}"
+            request_id_counter += 1
+            sampling_params = SamplingParams(
+                temperature=0.0, max_tokens=tokens, ignore_eos=True,
+            )
+            engine.add_request(request_id, prompt, sampling_params)
+
+        # Run engine steps until all requests complete
+        while engine.has_unfinished_requests():
+            outputs = engine.step()
+            total_steps += 1
+
+    del engine
+    torch.cuda.empty_cache()
+    return total_steps
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str, required=True)
+    parser.add_argument("--output", type=str, default="profiling_data.jsonl")
+    parser.add_argument("--num-frequencies", type=int, default=6)
+    parser.add_argument("--iterations-per-freq", type=int, default=80)
+    args = parser.parse_args()
+
+    all_freqs = query_supported_gpu_clocks()
+    selected_freqs = select_representative_frequencies(all_freqs, args.num_frequencies)
+
+    if Path(args.output).exists():
+        Path(args.output).unlink()
+
+    for freq_mhz in selected_freqs:
+        if not lock_gpu_clock(freq_mhz):
+            continue
+        os.environ["VLLM_PROFILING"] = "1"
+        os.environ["VLLM_PROFILING_FILE"] = args.output
+        os.environ["VLLM_PROFILING_WARMUP"] = "30"
+
+        profile_with_engine(
+            model_path=args.model_path,
+            output_file=args.output,
+            num_iterations=args.iterations_per_freq,
+            warmup_iterations=30,
+        )
+        reset_gpu_clock()
+
+    reset_gpu_clock()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### Alternative: High-Level API (Prefill-Only)
 
 **File**: `profiling_script.py`
+
+> **Note**: This approach only captures prefill batches. Use the LLMEngine-based approach above for full decode coverage.
 
 ```python
 #!/usr/bin/env python3
@@ -557,8 +776,24 @@ if __name__ == "__main__":
 # Activate environment
 conda activate myvllm
 
-# Run profiling (sweeps GPU frequencies, collects batch data)
-# Requires sudo for GPU clock locking
+# Run profiling with LLMEngine (recommended - captures both prefill and decode)
+PYTHONPATH=/home/ubuntu/lqs/vllm \
+python profiling_engine_script.py \
+    --model-path /home/ubuntu/lqs/L3 \
+    --output /home/ubuntu/lqs/profiling_data.jsonl \
+    --num-frequencies 6 \
+    --iterations-per-freq 80
+
+# Run fitting (reads data, fits parameters, reports MAPE)
+python fitting_script.py \
+    --input /home/ubuntu/lqs/profiling_data.jsonl \
+    --output-params fitted_params.json
+```
+
+### Alternative: High-Level API (prefill-only, not recommended)
+
+```bash
+# This approach only captures prefill batches
 PYTHONPATH=/home/ubuntu/lqs/vllm \
 VLLM_PROFILING=1 \
 VLLM_PROFILING_FILE=/home/ubuntu/lqs/profiling_data.jsonl \
@@ -567,11 +802,6 @@ python profiling_script.py \
     --output /home/ubuntu/lqs/profiling_data.jsonl \
     --num-frequencies 8 \
     --samples-per-config 3
-
-# Run fitting (reads data, fits parameters, reports MAPE)
-python fitting_script.py \
-    --input /home/ubuntu/lqs/profiling_data.jsonl \
-    --output-params fitted_params.json
 ```
 
 ## Output File Format
@@ -586,25 +816,30 @@ Each line is a JSON object representing one batch execution:
   "wall_time_ms": 45.67,
   "gpu_freq_mhz": 2100.0,
   "requests": [
-    {"req_id": "abc-123", "type": "prefill", "l_q": 256, "l_kv": 0},
-    {"req_id": "def-456", "type": "decode", "l_q": 1, "l_kv": 512}
+    {"req_id": "req-42", "type": "prefill", "l_q": 256, "l_kv": 0},
+    {"req_id": "req-38", "type": "decode", "l_q": 1, "l_kv": 512},
+    {"req_id": "req-39", "type": "decode", "l_q": 1, "l_kv": 384},
+    {"req_id": "req-40", "type": "decode", "l_q": 1, "l_kv": 256}
   ],
   "timestamp": 1712345678.123
 }
 ```
+
+**Note**: With the LLMEngine approach, most batches will contain decode requests. A typical profiling run produces a decode/prefill ratio of ~40:1.
 
 ### Fitted Parameters (JSON)
 
 ```json
 {
   "a_p": 0.0,
-  "b_p": 0.059,
-  "c_p": 331.5,
+  "b_p": 0.0,
+  "c_p": 386.43,
   "a_d": 0.0,
-  "b_d": 0.0,
-  "alpha": 0.05,
-  "t_c": 21.16,
-  "test_mape": 24.47
+  "b_d": 2058.31,
+  "alpha": 0.99,
+  "t_c": 15.98,
+  "train_mape": 14.57,
+  "test_mape": 14.57
 }
 ```
 
@@ -617,14 +852,30 @@ Each line is a JSON object representing one batch execution:
 
 ### No Decode Data
 - The `generate()` API with `max_tokens=1` only captures prefill
-- For decode data, use multi-step generation or direct `LLMEngine` instrumentation
+- **Solution**: Use `profiling_engine_script.py` with `LLMEngine.step()` approach
+- Verify decode capture: check that `num_decode > 0` in profiling data
 
 ### High MAPE
-- Increase `samples_per_config` for more data
+- Increase `iterations-per-freq` for more data
 - Ensure GPU temperature is stable (throttling affects results)
 - Check for other GPU workloads during profiling
+- Use the LLMEngine approach to capture decode data (reduces MAPE from ~25% to ~15%)
 
 ### Memory Issues
-- Reduce `max_num_seqs` in LLM initialization
+- Reduce `max_num_seqs` in engine arguments
 - Lower `gpu_memory_utilization`
 - Use smaller batch configurations
+
+### LLMEngine Import Issues
+- Ensure PYTHONPATH includes vLLM source: `PYTHONPATH=/home/ubuntu/lqs/vllm`
+- Check vLLM version (v0.19.0+ required for V1 engine)
+
+## Comparison: generate() vs LLMEngine.step()
+
+| Aspect | generate() API | LLMEngine.step() |
+|--------|----------------|------------------|
+| Decode visibility | Hidden | Exposed |
+| Batch control | Automatic | Manual |
+| Decode/Prefill ratio | ~0 | ~43:1 |
+| Typical MAPE | ~25% | ~15% |
+| Use case | Quick testing | Production profiling |

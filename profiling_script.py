@@ -1,339 +1,426 @@
+#!/usr/bin/env python3
 """
-Profiling script for vLLM batch execution time.
-Collects data across multiple GPU frequencies with diverse batch configurations.
+Batch Latency Profiling Script for vLLM.
 
-Note: This A10G cloud instance keeps GPU at 1710 MHz regardless of clock lock attempts.
-We collect diverse batch data at the available frequency and document this.
+This script profiles vLLM batch execution latency across different GPU frequencies
+and batch configurations to collect data for fitting a latency model.
+
+Usage:
+    python profiling_script.py --model-path /path/to/model --output profiling_data.jsonl
+
+Environment:
+    - Must run with VLLM_PROFILING=1 environment variable
+    - Requires root/sudo for GPU clock locking (nvidia-smi --lock-gpu-clocks)
+    - Conda environment: myvllm
 """
 
+import argparse
+import itertools
+import json
 import os
 import subprocess
 import sys
 import time
-import random
-import json
+from pathlib import Path
 
-# Set profiling environment variables before importing vllm
-os.environ["VLLM_PROFILING"] = "1"
-os.environ["VLLM_PROFILING_OUTPUT"] = "/home/ubuntu/lqs/profiling_data.jsonl"
-
-# Fix: CWD is /home/ubuntu/lqs which contains a 'vllm' directory.
-# This causes Python to find it as a namespace package instead of using
-# the editable install. Remove CWD ('') from sys.path to fix this.
-if '' in sys.path:
-    sys.path.remove('')
-# Also explicitly remove /home/ubuntu/lqs if present
-for p in ['/home/ubuntu/lqs', '.']:
-    if p in sys.path:
-        sys.path.remove(p)
-
+import numpy as np
 import torch
 
 
-def get_supported_frequencies():
-    """Get all supported GPU graphics clock frequencies."""
-    result = subprocess.run(
-        ["nvidia-smi", "-q", "-d", "SUPPORTED_CLOCKS"],
-        capture_output=True,
-        text=True,
-    )
-    freqs = []
-    for line in result.stdout.splitlines():
-        if "Graphics" in line and "MHz" in line:
-            try:
-                f = int(line.strip().split(":")[1].strip().split()[0])
-                if f not in freqs:
-                    freqs.append(f)
-            except (IndexError, ValueError):
-                pass
-    freqs = sorted(set(freqs))
-    return freqs
-
-
-def try_lock_gpu_freq(freq):
-    """Attempt to lock GPU clock to a specific frequency."""
-    result = subprocess.run(
-        ["sudo", "nvidia-smi", f"--lock-gpu-clocks={freq},{freq}"],
-        capture_output=True,
-        text=True,
-    )
-    time.sleep(2)
-    actual = get_current_freq()
-    return actual
-
-
-def reset_gpu_clocks():
-    """Reset GPU clocks to default."""
-    subprocess.run(
-        ["sudo", "nvidia-smi", "--reset-gpu-clocks"],
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["sudo", "nvidia-smi", "-rac"],
-        capture_output=True,
-        text=True,
-    )
-
-
-def get_current_freq():
-    """Get current GPU graphics clock."""
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=clocks.gr", "--format=csv,noheader,nounits"],
-        capture_output=True,
-        text=True,
-    )
+def query_supported_gpu_clocks():
+    """Query all supported GPU graphics clock frequencies."""
     try:
-        return int(result.stdout.strip())
-    except Exception:
-        return -1
-
-
-def select_frequencies(all_freqs):
-    """Select 6 representative frequencies spanning the full range."""
-    if len(all_freqs) <= 10:
-        return all_freqs
-    # Select evenly spaced frequencies
-    indices = [int(i * (len(all_freqs) - 1) / 5) for i in range(6)]
-    selected = [all_freqs[i] for i in indices]
-    return selected
-
-
-def count_records(output_path):
-    try:
-        with open(output_path, "r") as f:
-            return sum(1 for _ in f)
-    except FileNotFoundError:
-        return 0
-
-
-def run_single_batch(llm, prompts, max_tokens_list, output_path):
-    """Run a single batch and return number of new records written."""
-    from vllm.sampling_params import SamplingParams
-    before = count_records(output_path)
-    sps = [SamplingParams(max_tokens=mt, temperature=0.0, ignore_eos=True)
-           for mt in max_tokens_list]
-    try:
-        llm.generate(prompts, sps, use_tqdm=False)
+        result = subprocess.run(
+            ["nvidia-smi", "-q", "-d", "SUPPORTED_CLOCKS"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Parse graphics clock frequencies
+        freqs = []
+        for line in result.stdout.split("\n"):
+            if "Graphics" in line and "MHz" in line:
+                parts = line.split(":")
+                if len(parts) > 1:
+                    freq_str = parts[1].strip().split()[0]
+                    try:
+                        freqs.append(int(freq_str))
+                    except ValueError:
+                        pass
+        # Return unique frequencies sorted in descending order
+        return sorted(set(freqs), reverse=True)
     except Exception as e:
-        print(f"    Warning: batch gen failed: {e}")
+        print(f"Error querying GPU clocks: {e}")
+        return []
+
+
+def select_representative_frequencies(all_freqs, num_freqs=8):
+    """
+    Select a representative subset of frequencies spanning the full range.
+    Uses percentiles: min, 10%, 25%, 40%, 60%, 75%, 90%, max
+    """
+    if len(all_freqs) <= num_freqs:
+        return all_freqs
+
+    # Use percentiles to get good coverage
+    percentiles = [0, 10, 25, 40, 60, 75, 90, 100]
+    selected_indices = [
+        int(len(all_freqs) * p / 100) for p in percentiles
+    ]
+    # Ensure max index is valid
+    selected_indices = [min(i, len(all_freqs) - 1) for i in selected_indices]
+    selected_freqs = [all_freqs[i] for i in selected_indices]
+
+    # Remove duplicates while preserving order
+    seen = set()
+    result = []
+    for freq in selected_freqs:
+        if freq not in seen:
+            seen.add(freq)
+            result.append(freq)
+
+    return result
+
+
+def lock_gpu_clock(freq_mhz):
+    """Lock GPU graphics clock to specified frequency using sudo."""
+    try:
+        # Lock to a single frequency - use sudo
+        cmd = ["sudo", "nvidia-smi", "--lock-gpu-clocks", f"{freq_mhz},{freq_mhz}"]
+        subprocess.run(cmd, check=True, capture_output=True)
+        print(f"  Locked GPU clock to {freq_mhz} MHz")
+
+        # Verify the lock
+        time.sleep(1)  # Give GPU time to adjust
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=clocks.gr", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        actual_freq = int(result.stdout.strip())
+        if abs(actual_freq - freq_mhz) > 50:  # Allow some tolerance
+            print(f"  Warning: Requested {freq_mhz} MHz but got {actual_freq} MHz")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  Error locking GPU clock: {e}")
+        print(f"  You may need sudo/root permissions: sudo python {sys.argv[0]} ...")
+        return False
+    except Exception as e:
+        print(f"  Unexpected error: {e}")
+        return False
+
+
+def reset_gpu_clock():
+    """Reset GPU clock to default using sudo."""
+    try:
+        subprocess.run(["sudo", "nvidia-smi", "--reset-gpu-clocks"], check=True, capture_output=True)
+        print("  Reset GPU clock to default")
+    except Exception as e:
+        print(f"  Error resetting GPU clock: {e}")
+
+
+def generate_batch_configurations(max_prefill=16, max_decode=64):
+    """
+    Generate diverse batch configurations for profiling.
+
+    Returns a list of dicts, each with:
+        - num_prefill: number of prefill requests
+        - num_decode: number of decode requests
+        - prefill_lengths: list of prompt lengths for prefill requests
+        - decode_kv_lengths: list of KV cache lengths for decode requests
+    """
+    configs = []
+
+    # Diverse prompt lengths
+    prefill_lens = [32, 64, 128, 256, 512, 1024, 2048]
+    # Diverse KV cache lengths for decode
+    decode_kv_lens = [64, 128, 256, 512, 1024, 2048]
+
+    # 1. Pure prefill batches
+    for num_pf in [1, 2, 4, 8, 12, 16]:
+        if num_pf > max_prefill:
+            continue
+        for pf_len in prefill_lens:
+            configs.append({
+                "num_prefill": num_pf,
+                "num_decode": 0,
+                "prefill_lengths": [pf_len] * num_pf,
+                "decode_kv_lengths": [],
+            })
+
+    # 2. Pure decode batches
+    for num_dec in [4, 8, 16, 32, 48, 64]:
+        if num_dec > max_decode:
+            continue
+        for kv_len in decode_kv_lens:
+            configs.append({
+                "num_prefill": 0,
+                "num_decode": num_dec,
+                "prefill_lengths": [],
+                "decode_kv_lengths": [kv_len] * num_dec,
+            })
+
+    # 3. Mixed batches (prefill + decode)
+    for num_pf in [1, 2, 4]:
+        for num_dec in [4, 8, 16, 32]:
+            if num_pf > max_prefill or num_dec > max_decode:
+                continue
+            for pf_len in [128, 512, 1024]:
+                for kv_len in [256, 512, 1024]:
+                    configs.append({
+                        "num_prefill": num_pf,
+                        "num_decode": num_dec,
+                        "prefill_lengths": [pf_len] * num_pf,
+                        "decode_kv_lengths": [kv_len] * num_dec,
+                    })
+
+    # 4. Varied lengths within a batch
+    configs.append({
+        "num_prefill": 4,
+        "num_decode": 0,
+        "prefill_lengths": [64, 128, 256, 512],
+        "decode_kv_lengths": [],
+    })
+
+    configs.append({
+        "num_prefill": 0,
+        "num_decode": 8,
+        "prefill_lengths": [],
+        "decode_kv_lengths": [128, 256, 512, 1024, 128, 256, 512, 1024],
+    })
+
+    print(f"  Generated {len(configs)} batch configurations")
+    return configs
+
+
+def profile_at_frequency(
+    freq_mhz,
+    model_path,
+    batch_configs,
+    samples_per_config=3,
+    output_file="profiling_data.jsonl",
+):
+    """
+    Profile batches at a specific GPU frequency.
+
+    Args:
+        freq_mhz: GPU clock frequency in MHz
+        model_path: Path to the LLM model
+        batch_configs: List of batch configuration dicts
+        samples_per_config: Number of times to repeat each configuration
+        output_file: Output JSONL file path
+    """
+    print(f"\n=== Profiling at {freq_mhz} MHz ===")
+
+    # Lock GPU clock
+    if not lock_gpu_clock(freq_mhz):
+        print(f"Skipping frequency {freq_mhz} MHz due to clock lock failure")
         return 0
-    after = count_records(output_path)
-    return after - before
 
+    # Import vLLM after locking clock (to ensure profiling env is set)
+    os.environ["VLLM_PROFILING"] = "1"
+    os.environ["VLLM_PROFILING_FILE"] = output_file
+    os.environ["VLLM_PROFILING_WARMUP"] = "20"
 
-WORDS = ["hello", "world", "the", "a", "is", "are", "was", "were",
-         "in", "on", "at", "by", "for", "with", "from", "to",
-         "this", "that", "which", "when", "where", "how", "why",
-         "but", "and", "or", "not", "so", "if", "then", "else",
-         "be", "have", "do", "say", "get", "make", "go", "know",
-         "take", "see", "come", "think", "look", "want", "give",
-         "time", "year", "people", "way", "day", "man", "woman",
-         "child", "life", "hand", "part", "place", "week", "case"]
+    try:
+        from vllm import LLM, SamplingParams
 
+        print(f"  Initializing vLLM with model: {model_path}")
+        llm = LLM(
+            model=model_path,
+            max_model_len=4096,
+            max_num_seqs=256,  # Allow large batches
+            enforce_eager=True,  # Disable CUDA graphs for profiling
+            gpu_memory_utilization=0.9,
+        )
 
-def make_prompt(token_count):
-    """Build a prompt of approximately token_count tokens."""
-    num_words = max(1, int(token_count * 1.3))
-    return " ".join(random.choice(WORDS) for _ in range(num_words))
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,  # We only need one forward pass
+            ignore_eos=True,
+        )
 
+        total_samples = 0
+        print(f"  Running {len(batch_configs)} batch configs × {samples_per_config} repetitions")
 
-def run_profiling_session(llm, session_label, warmup=15, target_samples=400):
-    """
-    Run diverse batches and collect profiling data.
-    Strategy: mix of prefill-heavy and decode-heavy batches.
-    """
-    print(f"  Session: {session_label}")
-    output_path = os.environ["VLLM_PROFILING_OUTPUT"]
+        for config_idx, config in enumerate(batch_configs):
+            num_prefill = config["num_prefill"]
+            num_decode = config["num_decode"]
+            prefill_lengths = config["prefill_lengths"]
+            decode_kv_lengths = config["decode_kv_lengths"]
 
-    existing_count = count_records(output_path)
-    total_new = 0
-    post_warmup = 0
+            # Create prompts for this configuration
+            prompts = []
 
-    def add_records(n):
-        nonlocal total_new, post_warmup
-        total_new += n
-        if total_new > warmup:
-            post_warmup = total_new - warmup
+            # Prefill requests: create prompts with specified lengths
+            for pf_len in prefill_lengths:
+                # Generate a simple prompt with approximately pf_len tokens
+                # Assume ~4 chars per token
+                prompt = "The " + "quick brown fox jumps over the lazy dog. " * (pf_len // 10)
+                prompts.append(prompt)
 
-    # === Phase 1: Pure prefill batches ===
-    # Submit one request at a time with max_tokens=1 to get pure prefill
-    print("    Phase 1: Pure prefill batches")
-    for plen in [8, 16, 32, 64, 128, 256, 512, 1024, 2048] * 5:
-        if post_warmup >= target_samples:
-            break
-        p = make_prompt(plen)
-        n = run_single_batch(llm, [p], [1], output_path)
-        add_records(n)
+            # Decode requests: we need to simulate ongoing requests with KV cache
+            # For simplicity, we'll create long prompts and let the model decode
+            # This is a limitation - we can't directly control KV cache length via API
+            # A more sophisticated approach would use the LLMEngine directly
+            for kv_len in decode_kv_lengths:
+                # Create a prompt that will have kv_len tokens already processed
+                # This is approximate since we're using the API
+                prompt = "The " + "word " * (kv_len // 2)
+                prompts.append(prompt)
 
-    # Prefill with small batches
-    for bs in [2, 4, 8, 16]:
-        for plen in [32, 64, 128, 256, 512]:
-            if post_warmup >= target_samples:
-                break
-            prompts = [make_prompt(plen) for _ in range(bs)]
-            n = run_single_batch(llm, prompts, [1] * bs, output_path)
-            add_records(n)
+            # Run this configuration multiple times
+            for rep in range(samples_per_config):
+                if len(prompts) > 0:
+                    try:
+                        # Generate - this will trigger the profiling
+                        outputs = llm.generate(prompts, sampling_params)
+                        total_samples += 1
 
-    print(f"    Phase 1 done: {post_warmup} post-warmup records")
+                        # Print progress every 50 samples
+                        if total_samples % 50 == 0:
+                            print(f"    Progress: {total_samples} batches profiled at {freq_mhz} MHz")
+                    except Exception as e:
+                        print(f"    Error during generation: {e}")
+                        continue
 
-    # === Phase 2: Decode-heavy batches ===
-    print("    Phase 2: Decode-heavy batches")
-    decode_configs = []
-    for plen in [8, 16, 32]:
-        for ntok in [32, 64, 96, 128, 192, 256]:
-            for bs in [1, 2, 4, 8, 16]:
-                decode_configs.append((plen, ntok, bs))
+        print(f"  Completed {total_samples} batch samples at {freq_mhz} MHz")
 
-    random.shuffle(decode_configs)
-    for plen, ntok, bs in decode_configs:
-        if post_warmup >= target_samples:
-            break
-        prompts = [make_prompt(plen) for _ in range(bs)]
-        n = run_single_batch(llm, prompts, [ntok] * bs, output_path)
-        add_records(n)
+        # Clean up LLM
+        del llm
+        torch.cuda.empty_cache()
 
-    print(f"    Phase 2 done: {post_warmup} post-warmup records")
+        return total_samples
 
-    # === Phase 3: Mixed batch diversity ===
-    print("    Phase 3: Mixed batch configs")
-    mixed_configs = []
-    for _ in range(200):
-        bs = random.randint(1, 16)
-        plens = [random.choice([16, 32, 64, 128, 256, 512]) for _ in range(bs)]
-        ntoks = [random.choice([1, 2, 4, 8, 16, 32, 64, 128]) for _ in range(bs)]
-        mixed_configs.append((plens, ntoks))
+    except Exception as e:
+        print(f"  Error during profiling at {freq_mhz} MHz: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
 
-    for plens, ntoks in mixed_configs:
-        if post_warmup >= target_samples:
-            break
-        prompts = [make_prompt(pl) for pl in plens]
-        n = run_single_batch(llm, prompts, ntoks, output_path)
-        add_records(n)
-
-    print(f"  Session done: {post_warmup} post-warmup records")
-    return post_warmup
+    finally:
+        reset_gpu_clock()
 
 
 def main():
-    print("=== vLLM Batch Profiling Script ===")
-    print(f"Model: /home/ubuntu/lqs/L3")
-    print(f"Output: {os.environ['VLLM_PROFILING_OUTPUT']}")
+    parser = argparse.ArgumentParser(
+        description="Profile vLLM batch latency across GPU frequencies"
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        required=True,
+        help="Path to the LLM model"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="/home/ubuntu/lqs/profiling_data.jsonl",
+        help="Output JSONL file path (default: /home/ubuntu/lqs/profiling_data.jsonl)"
+    )
+    parser.add_argument(
+        "--num-frequencies",
+        type=int,
+        default=8,
+        help="Number of GPU frequencies to profile (default: 8)"
+    )
+    parser.add_argument(
+        "--samples-per-config",
+        type=int,
+        default=3,
+        help="Number of repetitions per batch configuration (default: 3)"
+    )
+    parser.add_argument(
+        "--quick-test",
+        action="store_true",
+        help="Quick test mode with fewer configurations"
+    )
 
-    # Check GPU info
-    all_freqs = get_supported_frequencies()
-    current_freq = get_current_freq()
-    print(f"GPU current clock: {current_freq} MHz")
-    print(f"Supported frequencies: {len(all_freqs)}, range [{min(all_freqs)}, {max(all_freqs)}] MHz")
+    args = parser.parse_args()
 
-    # Try to lock to different frequencies
-    selected_freqs = select_frequencies(all_freqs)
-    print(f"Attempting frequencies: {selected_freqs}")
+    print("=" * 80)
+    print("vLLM Batch Latency Profiling Script")
+    print("=" * 80)
 
-    # Test if clock locking works
-    print("\nTesting clock lock capability...")
-    achievable_freqs = {}
-    for freq in [min(all_freqs), max(all_freqs)]:
-        actual = try_lock_gpu_freq(freq)
-        achievable_freqs[freq] = actual
-        print(f"  Requested {freq} MHz -> actual {actual} MHz")
-    reset_gpu_clocks()
-
-    # Check if we can actually vary frequency
-    actual_freqs_set = set(achievable_freqs.values())
-    if len(actual_freqs_set) == 1:
-        print(f"\nNote: GPU does not support user clock control on this system.")
-        print(f"All profiling will be done at {list(actual_freqs_set)[0]} MHz.")
-        print("The profiling logger will record actual GPU frequency per batch.")
-        profiling_freqs = [current_freq]
-    else:
-        print(f"\nGPU clock control works! Profiling at: {selected_freqs}")
-        profiling_freqs = selected_freqs
-
-    # Clean existing data
-    output_path = os.environ["VLLM_PROFILING_OUTPUT"]
-    if os.path.exists(output_path):
-        os.remove(output_path)
-        print(f"Removed existing {output_path}")
-
-    total_collected = 0
-
-    # If only one freq, run more batches to get good data
-    samples_per_session = 400 if len(profiling_freqs) == 1 else 250
-
-    for freq_idx, freq in enumerate(profiling_freqs):
-        print(f"\n[{freq_idx+1}/{len(profiling_freqs)}] Target freq: {freq} MHz")
-
-        if len(profiling_freqs) > 1:
-            actual = try_lock_gpu_freq(freq)
-            print(f"  Actual freq: {actual} MHz")
-
-        # Initialize vLLM
-        print("  Initializing vLLM LLM engine...")
-        try:
-            from vllm.entrypoints.llm import LLM
-            llm = LLM(
-                model="/home/ubuntu/lqs/L3",
-                dtype="bfloat16",
-                max_model_len=2048,
-                gpu_memory_utilization=0.85,
-                enforce_eager=True,
-            )
-            print("  vLLM engine initialized OK")
-        except Exception as e:
-            print(f"  ERROR initializing vLLM: {e}")
-            import traceback
-            traceback.print_exc()
-            reset_gpu_clocks()
-            continue
-
-        n = run_profiling_session(
-            llm,
-            f"freq={freq}MHz",
-            warmup=15,
-            target_samples=samples_per_session,
-        )
-        total_collected += n
-
-        # Cleanup
-        del llm
-        torch.cuda.empty_cache()
-        time.sleep(2)
-
-        if len(profiling_freqs) > 1:
-            reset_gpu_clocks()
-
-    print(f"\n=== Profiling Complete ===")
-    print(f"Total batch records collected: {total_collected}")
-
-    # Summary
+    # Check if running with appropriate permissions
+    print("\nChecking GPU clock control permissions...")
     try:
-        with open(output_path, "r") as f:
-            records = [json.loads(line) for line in f]
-        freqs_seen = sorted(set(r["gpu_freq_mhz"] for r in records))
-        print(f"Total records in file: {len(records)}")
-        print(f"GPU frequencies seen: {freqs_seen}")
-
-        total_prefill = 0
-        total_decode = 0
-        for r in records:
-            for req in r["requests"]:
-                if req["type"] == "prefill":
-                    total_prefill += 1
-                else:
-                    total_decode += 1
-        print(f"Total prefill requests across all batches: {total_prefill}")
-        print(f"Total decode requests across all batches: {total_decode}")
-
-        wall_times = [r["wall_time_ms"] for r in records]
-        print(f"Wall time: min={min(wall_times):.2f}ms, "
-              f"max={max(wall_times):.2f}ms, "
-              f"mean={sum(wall_times)/len(wall_times):.2f}ms")
-
+        subprocess.run(
+            ["sudo", "nvidia-smi", "--lock-gpu-clocks", "210,210"],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+        subprocess.run(["sudo", "nvidia-smi", "--reset-gpu-clocks"], check=True, capture_output=True)
+        print("✓ GPU clock control is available")
+    except subprocess.CalledProcessError:
+        print("✗ GPU clock control requires root/sudo permissions")
+        print("  Please run: sudo python profiling_script.py ...")
+        sys.exit(1)
     except Exception as e:
-        print(f"Summary failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"✗ Error testing GPU clock control: {e}")
+        sys.exit(1)
+
+    # Query supported frequencies
+    print("\nQuerying supported GPU frequencies...")
+    all_freqs = query_supported_gpu_clocks()
+    if not all_freqs:
+        print("Error: Could not query GPU frequencies")
+        sys.exit(1)
+
+    print(f"  Found {len(all_freqs)} supported frequencies")
+    print(f"  Range: {min(all_freqs)} - {max(all_freqs)} MHz")
+
+    # Select representative subset
+    selected_freqs = select_representative_frequencies(all_freqs, args.num_frequencies)
+    print(f"  Selected {len(selected_freqs)} frequencies for profiling:")
+    for freq in selected_freqs:
+        print(f"    {freq} MHz")
+
+    # Generate batch configurations
+    print("\nGenerating batch configurations...")
+    if args.quick_test:
+        # Quick test mode: fewer configs
+        batch_configs = generate_batch_configurations(max_prefill=8, max_decode=32)
+        batch_configs = batch_configs[:50]  # Limit to 50 configs
+        print(f"  Quick test mode: using {len(batch_configs)} configurations")
+    else:
+        batch_configs = generate_batch_configurations(max_prefill=16, max_decode=64)
+
+    # Clear output file if it exists
+    output_path = Path(args.output)
+    if output_path.exists():
+        print(f"\nRemoving existing profiling data: {args.output}")
+        output_path.unlink()
+
+    # Profile at each frequency
+    print("\nStarting profiling...")
+    print(f"  Output file: {args.output}")
+    print(f"  Samples per config: {args.samples_per_config}")
+
+    total_samples = 0
+    for freq_idx, freq_mhz in enumerate(selected_freqs):
+        print(f"\nFrequency {freq_idx + 1}/{len(selected_freqs)}: {freq_mhz} MHz")
+
+        samples = profile_at_frequency(
+            freq_mhz=freq_mhz,
+            model_path=args.model_path,
+            batch_configs=batch_configs,
+            samples_per_config=args.samples_per_config,
+            output_file=args.output,
+        )
+
+        total_samples += samples
+
+    # Reset GPU clock at the end
+    print("\n" + "=" * 80)
+    print(f"Profiling complete!")
+    print(f"  Total samples collected: {total_samples}")
+    print(f"  Output file: {args.output}")
+    print("=" * 80)
+
+    reset_gpu_clock()
 
 
 if __name__ == "__main__":

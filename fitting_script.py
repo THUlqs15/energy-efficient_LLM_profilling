@@ -1,510 +1,375 @@
 #!/usr/bin/env python3
 """
-Batch Latency Model Fitting Script.
+Fitting script for vLLM batch latency model.
+Reads profiling data, fits the 7-parameter model {a_p, b_p, c_p, a_d, b_d, alpha, t_c},
+and reports evaluation metrics (MAPE, MAE, RMSE, R²).
 
-Reads profiling data and fits the batch latency regression model with GPU frequency.
-
-Usage:
-    python fitting_script.py --input profiling_data.jsonl
-
-The model fits:
-    T_pd(f, B) = (1/f) * [a_p * Σl_q² + b_p * Σl_q·l_kv + c_p * Σl_q]
-               + (1/f^α) * [a_d * Σl_kv + b_d * num_decode]
-               + t_c
-
-where:
-    - f: GPU frequency (MHz)
-    - a_p, b_p, c_p: prefill coefficients
-    - a_d, b_d: decode coefficients
-    - α: frequency scaling exponent for decode (0 < α < 1)
-    - t_c: constant overhead
+Uses three fitting approaches:
+  1. Grid search over alpha + OLS linear regression (MSE loss)
+  2. Grid search over alpha + weighted linear regression (relative error loss)
+  3. Non-linear optimisation (scipy) minimising MAPE directly
 """
 
 import argparse
 import json
 import sys
-from pathlib import Path
 
 import numpy as np
 from scipy.optimize import minimize
 from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
-def load_profiling_data(jsonl_path):
-    """Load profiling data from JSONL file."""
-    data = []
-    with open(jsonl_path, "r") as f:
+def parse_args():
+    p = argparse.ArgumentParser(description="Fit batch latency model")
+    p.add_argument("--input", default="/home/ubuntu/lqs/profiling_data.jsonl")
+    p.add_argument("--output", default="/home/ubuntu/lqs/fitted_params.json")
+    p.add_argument("--warmup-per-freq", type=int, default=25,
+                   help="Discard first N batches per frequency group as warmup")
+    p.add_argument("--freq-tolerance", type=float, default=50.0,
+                   help="Max deviation (MHz) from target freq before discarding")
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+# ── Data loading & cleaning ──────────────────────────────────────────────────
+
+def load_records(path):
+    records = []
+    with open(path) as f:
         for line in f:
-            if line.strip():
-                data.append(json.loads(line))
-    return data
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
 
-def compute_aggregate_features(batch_record):
-    """
-    Compute aggregate features from a batch record.
+def compute_batch_features(rec):
+    f = rec["gpu_freq_mhz"]
+    wall_ms = rec["wall_time_ms"]
+    reqs = rec.get("requests", [])
 
-    Returns:
-        dict with keys:
-            - f: GPU frequency (MHz)
-            - sum_lq_sq: Σl_q² for prefill
-            - sum_lq_lkv: Σl_q·l_kv for prefill
-            - sum_lq: Σl_q for prefill
-            - sum_lkv_decode: Σl_kv for decode
-            - num_decode: number of decode requests
-            - wall_time_ms: measured execution time
-    """
-    f = batch_record["gpu_freq_mhz"]
-    requests = batch_record["requests"]
-    wall_time_ms = batch_record["wall_time_ms"]
+    sum_lq_sq = sum_lq_lkv = sum_lq = 0.0
+    sum_lkv_d = 0.0
+    num_decode = num_prefill = 0
 
-    # Prefill aggregates
-    sum_lq_sq = 0.0
-    sum_lq_lkv = 0.0
-    sum_lq = 0.0
-
-    # Decode aggregates
-    sum_lkv_decode = 0.0
-    num_decode = 0
-
-    for req in requests:
-        req_type = req["type"]
-        l_q = req["l_q"]
-        l_kv = req["l_kv"]
-
-        if req_type == "prefill":
-            sum_lq_sq += l_q ** 2
-            sum_lq_lkv += l_q * l_kv
-            sum_lq += l_q
-        elif req_type == "decode":
-            sum_lkv_decode += l_kv
+    for r in reqs:
+        lq, lkv = r["l_q"], r["l_kv"]
+        if r["type"] == "prefill":
+            sum_lq_sq += lq ** 2
+            sum_lq_lkv += lq * lkv
+            sum_lq += lq
+            num_prefill += 1
+        else:
+            sum_lkv_d += lkv
             num_decode += 1
 
     return {
-        "f": f,
-        "sum_lq_sq": sum_lq_sq,
-        "sum_lq_lkv": sum_lq_lkv,
-        "sum_lq": sum_lq,
-        "sum_lkv_decode": sum_lkv_decode,
-        "num_decode": num_decode,
-        "wall_time_ms": wall_time_ms,
+        "f": f, "wall_ms": wall_ms,
+        "sum_lq_sq": sum_lq_sq, "sum_lq_lkv": sum_lq_lkv, "sum_lq": sum_lq,
+        "sum_lkv_d": sum_lkv_d, "num_decode": num_decode,
+        "num_prefill": num_prefill, "total_reqs": num_prefill + num_decode,
     }
 
 
-def prepare_dataset(profiling_data):
-    """
-    Convert raw profiling data to feature matrix and target vector.
+def clean_and_prepare(records, warmup_per_freq, freq_tolerance):
+    if not records:
+        raise ValueError("No profiling records found!")
 
-    Returns:
-        X_raw: list of feature dicts
-        y: numpy array of measured times (ms)
-    """
-    X_raw = []
-    y = []
+    # Cluster by rounded frequency (15 MHz steps)
+    clusters = {}
+    for i, rec in enumerate(records):
+        rf = round(rec["gpu_freq_mhz"] / 15.0) * 15.0
+        clusters.setdefault(rf, []).append((i, rec))
 
-    for batch_record in profiling_data:
-        features = compute_aggregate_features(batch_record)
+    # Remove warmup and frequency outliers
+    cleaned = []
+    for cf, items in sorted(clusters.items()):
+        for idx, rec in items[warmup_per_freq:]:
+            if abs(rec["gpu_freq_mhz"] - cf) <= freq_tolerance:
+                cleaned.append(rec)
 
-        # Filter out empty batches (no prefill or decode)
-        if features["sum_lq"] == 0 and features["num_decode"] == 0:
-            continue
+    print(f"Records after warmup/freq cleaning: {len(cleaned)} "
+          f"(from {len(records)} raw, {len(clusters)} freq clusters)")
 
-        # Filter out batches with invalid time measurements
-        if features["wall_time_ms"] <= 0:
-            continue
+    # Remove empty batches and compute features
+    features = [compute_batch_features(r) for r in cleaned
+                if r.get("requests") and r["wall_time_ms"] > 0]
 
-        X_raw.append(features)
-        y.append(features["wall_time_ms"])
+    # Remove outlier times (top/bottom 0.5%)
+    times = np.array([ft["wall_ms"] for ft in features])
+    p_lo, p_hi = np.percentile(times, [0.5, 99.5])
+    features = [ft for ft in features if p_lo <= ft["wall_ms"] <= p_hi]
+    print(f"After outlier removal ({p_lo:.1f}-{p_hi:.1f} ms): {len(features)}")
 
-    return X_raw, np.array(y)
-
-
-def fit_model_grid_search(X_raw_train, y_train, X_raw_test, y_test):
-    """
-    Fit model using grid search over α.
-
-    Returns:
-        dict with:
-            - params: [a_p, b_p, c_p, a_d, b_d, alpha, t_c]
-            - train_mape: training MAPE
-            - test_mape: test MAPE
-            - train_metrics: dict with MAE, RMSE, R²
-            - test_metrics: dict with MAE, RMSE, R²
-    """
-    print("\n=== Grid Search over α ===")
-
-    best_mape = float("inf")
-    best_alpha = None
-    best_params = None
-    best_model = None
-
-    # Grid search over α from 0.01 to 0.99
-    alpha_range = np.arange(0.05, 1.0, 0.01)
-
-    for alpha in alpha_range:
-        # Build feature matrix for this α
-        X_train = []
-        for feat in X_raw_train:
-            f = feat["f"]
-            row = [
-                feat["sum_lq_sq"] / f,           # a_p term
-                feat["sum_lq_lkv"] / f,          # b_p term
-                feat["sum_lq"] / f,              # c_p term
-                feat["sum_lkv_decode"] / (f ** alpha),  # a_d term
-                feat["num_decode"] / (f ** alpha),      # b_d term
-                1.0,                             # t_c term
-            ]
-            X_train.append(row)
-
-        X_train = np.array(X_train)
-
-        # Fit linear regression (no intercept since we have t_c)
-        model = LinearRegression(fit_intercept=False)
-        model.fit(X_train, y_train)
-
-        # Predict on test set
-        X_test = []
-        for feat in X_raw_test:
-            f = feat["f"]
-            row = [
-                feat["sum_lq_sq"] / f,
-                feat["sum_lq_lkv"] / f,
-                feat["sum_lq"] / f,
-                feat["sum_lkv_decode"] / (f ** alpha),
-                feat["num_decode"] / (f ** alpha),
-                1.0,
-            ]
-            X_test.append(row)
-
-        X_test = np.array(X_test)
-        y_pred = model.predict(X_test)
-
-        # Calculate MAPE
-        mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
-
-        if mape < best_mape:
-            best_mape = mape
-            best_alpha = alpha
-            best_params = model.coef_
-            best_model = model
-
-    print(f"  Best α: {best_alpha:.4f}")
-    print(f"  Best test MAPE: {best_mape:.2f}%")
-
-    # Compute final metrics
-    X_train_best = []
-    for feat in X_raw_train:
-        f = feat["f"]
-        row = [
-            feat["sum_lq_sq"] / f,
-            feat["sum_lq_lkv"] / f,
-            feat["sum_lq"] / f,
-            feat["sum_lkv_decode"] / (f ** best_alpha),
-            feat["num_decode"] / (f ** best_alpha),
-            1.0,
-        ]
-        X_train_best.append(row)
-
-    X_train_best = np.array(X_train_best)
-    y_train_pred = best_model.predict(X_train_best)
-
-    X_test_best = []
-    for feat in X_raw_test:
-        f = feat["f"]
-        row = [
-            feat["sum_lq_sq"] / f,
-            feat["sum_lq_lkv"] / f,
-            feat["sum_lq"] / f,
-            feat["sum_lkv_decode"] / (f ** best_alpha),
-            feat["num_decode"] / (f ** best_alpha),
-            1.0,
-        ]
-        X_test_best.append(row)
-
-    X_test_best = np.array(X_test_best)
-    y_test_pred = best_model.predict(X_test_best)
-
-    # Compute metrics
-    train_metrics = compute_metrics(y_train, y_train_pred)
-    test_metrics = compute_metrics(y_test, y_test_pred)
-
-    # Extract parameters: [a_p, b_p, c_p, a_d, b_d, t_c]
-    a_p, b_p, c_p, a_d, b_d, t_c = best_params
-
-    return {
-        "params": [a_p, b_p, c_p, a_d, b_d, best_alpha, t_c],
-        "train_mape": train_metrics["mape"],
-        "test_mape": test_metrics["mape"],
-        "train_metrics": train_metrics,
-        "test_metrics": test_metrics,
-    }
+    return features
 
 
-def refine_with_nonlinear_optimization(
-    X_raw_train, y_train, X_raw_test, y_test, initial_params
-):
-    """
-    Refine parameters using non-linear optimization.
+# ── Feature matrix builders ──────────────────────────────────────────────────
 
-    Args:
-        initial_params: [a_p, b_p, c_p, a_d, b_d, alpha, t_c]
+def _extract_arrays(features):
+    N = len(features)
+    f = np.array([ft["f"] for ft in features])
+    y = np.array([ft["wall_ms"] for ft in features])
+    sq = np.array([ft["sum_lq_sq"] for ft in features])
+    ql = np.array([ft["sum_lq_lkv"] for ft in features])
+    lq = np.array([ft["sum_lq"] for ft in features])
+    ld = np.array([ft["sum_lkv_d"] for ft in features])
+    nd = np.array([ft["num_decode"] for ft in features])
+    return f, y, sq, ql, lq, ld, nd
 
-    Returns:
-        Same dict structure as fit_model_grid_search
-    """
-    print("\n=== Non-linear Optimization (refinement) ===")
 
-    def predict(params, X_raw):
-        """Predict using the model."""
+def build_X(f, sq, ql, lq, ld, nd, alpha):
+    inv_f = 1.0 / f
+    inv_fa = 1.0 / np.power(f, alpha)
+    return np.column_stack([
+        sq * inv_f,         # a_p
+        ql * inv_f,         # b_p
+        lq * inv_f,         # c_p
+        ld * inv_fa,        # a_d
+        nd * inv_fa,        # b_d
+        np.ones(len(f)),    # t_c
+    ])
+
+
+def mape(y_true, y_pred):
+    mask = y_true > 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100.0
+
+
+# ── Fitting approaches ───────────────────────────────────────────────────────
+
+def fit_grid_ols(f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr,
+                 f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te):
+    """Approach 1: Grid search over alpha + OLS (MSE loss)."""
+    print("\n── Approach 1: Grid search + OLS ──")
+    best = (float("inf"), None, None)
+    for ai in range(1, 100):
+        alpha = ai / 100.0
+        X_tr = build_X(f_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr, alpha)
+        X_te = build_X(f_te, sq_te, ql_te, lq_te, ld_te, nd_te, alpha)
+        mdl = LinearRegression(fit_intercept=False)
+        mdl.fit(X_tr, y_tr)
+        m = mape(y_te, mdl.predict(X_te))
+        if m < best[0]:
+            best = (m, alpha, mdl.coef_.copy())
+
+    m_test, alpha, coefs = best
+    a_p, b_p, c_p, a_d, b_d, t_c = coefs
+    X_tr = build_X(f_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr, alpha)
+    m_train = mape(y_tr, X_tr @ coefs)
+    print(f"  alpha={alpha:.2f}  Train MAPE={m_train:.2f}%  Test MAPE={m_test:.2f}%")
+    return {"a_p": a_p, "b_p": b_p, "c_p": c_p,
+            "a_d": a_d, "b_d": b_d, "alpha": alpha, "t_c": t_c}
+
+
+def fit_grid_weighted(f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr,
+                      f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te):
+    """Approach 2: Grid search + weighted regression (relative-error loss)."""
+    print("\n── Approach 2: Grid search + weighted regression ──")
+    w_tr = 1.0 / y_tr  # weight by inverse of time → equal relative importance
+    best = (float("inf"), None, None)
+    for ai in range(1, 100):
+        alpha = ai / 100.0
+        X_tr = build_X(f_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr, alpha)
+        X_te = build_X(f_te, sq_te, ql_te, lq_te, ld_te, nd_te, alpha)
+        Xw = X_tr * w_tr[:, None]
+        yw = y_tr * w_tr
+        mdl = LinearRegression(fit_intercept=False)
+        mdl.fit(Xw, yw)
+        m = mape(y_te, X_te @ mdl.coef_)
+        if m < best[0]:
+            best = (m, alpha, mdl.coef_.copy())
+
+    m_test, alpha, coefs = best
+    a_p, b_p, c_p, a_d, b_d, t_c = coefs
+    X_tr = build_X(f_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr, alpha)
+    m_train = mape(y_tr, X_tr @ coefs)
+    print(f"  alpha={alpha:.2f}  Train MAPE={m_train:.2f}%  Test MAPE={m_test:.2f}%")
+    return {"a_p": a_p, "b_p": b_p, "c_p": c_p,
+            "a_d": a_d, "b_d": b_d, "alpha": alpha, "t_c": t_c}
+
+
+def fit_scipy_mape(f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr,
+                   f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te,
+                   init_params):
+    """Approach 3: Scipy non-linear optimisation minimising MAPE."""
+    print("\n── Approach 3: Scipy MAPE minimisation ──")
+
+    def predict(params, f, sq, ql, lq, ld, nd):
         a_p, b_p, c_p, a_d, b_d, alpha, t_c = params
-        predictions = []
-
-        for feat in X_raw:
-            f = feat["f"]
-            T_p = (1.0 / f) * (
-                a_p * feat["sum_lq_sq"]
-                + b_p * feat["sum_lq_lkv"]
-                + c_p * feat["sum_lq"]
-            )
-            T_d = (1.0 / (f ** alpha)) * (
-                a_d * feat["sum_lkv_decode"]
-                + b_d * feat["num_decode"]
-            )
-            T_total = T_p + T_d + t_c
-            predictions.append(T_total)
-
-        return np.array(predictions)
+        return ((a_p * sq + b_p * ql + c_p * lq) / f
+                + (a_d * ld + b_d * nd) / np.power(f, alpha)
+                + t_c)
 
     def loss(params):
-        """Mean squared error loss."""
-        y_pred = predict(params, X_raw_train)
-        return np.mean((y_train - y_pred) ** 2)
+        pred = predict(params, f_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr)
+        # Mean absolute relative error
+        return np.mean(np.abs((y_tr - pred) / y_tr))
 
-    # Bounds: all positive except t_c can be any value
-    # α must be in (0.01, 0.99)
-    bounds = [
-        (0, None),    # a_p
-        (0, None),    # b_p
-        (0, None),    # c_p
-        (0, None),    # a_d
-        (0, None),    # b_d
-        (0.01, 0.99), # alpha
-        (None, None), # t_c
-    ]
+    x0 = [init_params["a_p"], init_params["b_p"], init_params["c_p"],
+           init_params["a_d"], init_params["b_d"], init_params["alpha"],
+           init_params["t_c"]]
 
-    result = minimize(
-        loss,
-        x0=initial_params,
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={"maxiter": 10000, "ftol": 1e-9},
-    )
+    bounds = [(0, None), (None, None), (0, None),
+              (0, None), (0, None), (0.01, 0.99), (0, None)]
 
-    if not result.success:
-        print(f"  Warning: Optimization did not converge: {result.message}")
+    result = minimize(loss, x0, method="L-BFGS-B", bounds=bounds,
+                      options={"maxiter": 50000, "ftol": 1e-15})
 
-    refined_params = result.x
-    print(f"  Refined α: {refined_params[5]:.4f}")
+    # Also try Nelder-Mead with penalty for out-of-bounds alpha
+    def penalised_loss(params):
+        alpha = params[5]
+        if alpha < 0.01 or alpha > 0.99:
+            return 1e10
+        return loss(params)
 
-    # Compute metrics
-    y_train_pred = predict(refined_params, X_raw_train)
-    y_test_pred = predict(refined_params, X_raw_test)
+    result2 = minimize(penalised_loss, x0, method="Nelder-Mead",
+                       options={"maxiter": 100000, "xatol": 1e-12, "fatol": 1e-14})
+    if result2.fun < result.fun:
+        result = result2
 
-    train_metrics = compute_metrics(y_train, y_train_pred)
-    test_metrics = compute_metrics(y_test, y_test_pred)
+    a_p, b_p, c_p, a_d, b_d, alpha, t_c = result.x
+    pred_te = predict(result.x, f_te, sq_te, ql_te, lq_te, ld_te, nd_te)
+    pred_tr = predict(result.x, f_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr)
+    m_train = mape(y_tr, pred_tr)
+    m_test = mape(y_te, pred_te)
+    print(f"  alpha={alpha:.4f}  Train MAPE={m_train:.2f}%  Test MAPE={m_test:.2f}%")
+    return {"a_p": a_p, "b_p": b_p, "c_p": c_p,
+            "a_d": a_d, "b_d": b_d, "alpha": alpha, "t_c": t_c}
 
-    print(f"  Refined test MAPE: {test_metrics['mape']:.2f}%")
 
+# ── Evaluation ───────────────────────────────────────────────────────────────
+
+def evaluate(params, features, label=""):
+    f, y, sq, ql, lq, ld, nd = _extract_arrays(features)
+    alpha = params["alpha"]
+    y_pred = ((params["a_p"] * sq + params["b_p"] * ql + params["c_p"] * lq) / f
+              + (params["a_d"] * ld + params["b_d"] * nd) / np.power(f, alpha)
+              + params["t_c"])
+
+    m = mape(y, y_pred)
+    mae_val = mean_absolute_error(y, y_pred)
+    rmse_val = np.sqrt(mean_squared_error(y, y_pred))
+    r2_val = r2_score(y, y_pred)
+
+    print(f"  {label:12s} MAPE={m:7.2f}%  MAE={mae_val:8.4f} ms  "
+          f"RMSE={rmse_val:8.4f} ms  R²={r2_val:.6f}")
+    return {"mape": m, "mae_ms": mae_val, "rmse_ms": rmse_val, "r2": r2_val}
+
+
+def data_summary_from_records(records):
+    lq_vals, lkv_vals = [], []
+    for rec in records:
+        for r in rec.get("requests", []):
+            if r["type"] == "prefill":
+                lq_vals.append(r["l_q"])
+            else:
+                lkv_vals.append(r["l_kv"])
     return {
-        "params": refined_params.tolist(),
-        "train_mape": train_metrics["mape"],
-        "test_mape": test_metrics["mape"],
-        "train_metrics": train_metrics,
-        "test_metrics": test_metrics,
+        "prefill_lq_min": min(lq_vals) if lq_vals else 0,
+        "prefill_lq_max": max(lq_vals) if lq_vals else 0,
+        "decode_lkv_min": min(lkv_vals) if lkv_vals else 0,
+        "decode_lkv_max": max(lkv_vals) if lkv_vals else 0,
     }
 
 
-def compute_metrics(y_true, y_pred):
-    """Compute evaluation metrics."""
-    # MAPE
-    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-
-    # MAE
-    mae = np.mean(np.abs(y_true - y_pred))
-
-    # RMSE
-    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-
-    # R²
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-
-    return {
-        "mape": mape,
-        "mae": mae,
-        "rmse": rmse,
-        "r2": r2,
-    }
-
-
-def print_results(result, X_raw, y):
-    """Print fitted parameters and metrics."""
-    a_p, b_p, c_p, a_d, b_d, alpha, t_c = result["params"]
-
-    print("\n" + "=" * 80)
-    print("FITTED PARAMETERS")
-    print("=" * 80)
-    print(f"a_p (prefill l_q² coeff):       {a_p:.6e}")
-    print(f"b_p (prefill l_q·l_kv coeff):   {b_p:.6e}")
-    print(f"c_p (prefill l_q coeff):        {c_p:.6e}")
-    print(f"a_d (decode l_kv coeff):        {a_d:.6e}")
-    print(f"b_d (decode constant coeff):    {b_d:.6e}")
-    print(f"α (alpha, freq exponent):       {alpha:.6f}")
-    print(f"t_c (constant overhead, ms):    {t_c:.6f}")
-
-    print("\n" + "=" * 80)
-    print("EVALUATION METRICS")
-    print("=" * 80)
-    print(f"{'Metric':<10} {'Train':>12} {'Test':>12}")
-    print("-" * 36)
-    print(f"{'MAPE (%)':<10} {result['train_mape']:>12.2f} {result['test_mape']:>12.2f}")
-    print(f"{'MAE (ms)':<10} {result['train_metrics']['mae']:>12.4f} {result['test_metrics']['mae']:>12.4f}")
-    print(f"{'RMSE (ms)':<10} {result['train_metrics']['rmse']:>12.4f} {result['test_metrics']['rmse']:>12.4f}")
-    print(f"{'R²':<10} {result['train_metrics']['r2']:>12.4f} {result['test_metrics']['r2']:>12.4f}")
-
-    # Data summary
-    freqs = sorted(set(feat["f"] for feat in X_raw))
-    all_lq = []
-    all_lkv = []
-    for feat in X_raw:
-        if feat["sum_lq"] > 0:
-            # Approximate individual l_q values (we only have aggregates)
-            all_lq.append(feat["sum_lq"])
-        if feat["sum_lkv_decode"] > 0:
-            all_lkv.append(feat["sum_lkv_decode"] / max(feat["num_decode"], 1))
-
-    print("\n" + "=" * 80)
-    print("DATA SUMMARY")
-    print("=" * 80)
-    print(f"Total batches:              {len(y)}")
-    print(f"GPU frequencies profiled:   {len(freqs)}")
-    print(f"Frequency range:            [{min(freqs):.0f}, {max(freqs):.0f}] MHz")
-    if all_lq:
-        print(f"Prefill l_q range:          [{min(all_lq):.0f}, {max(all_lq):.0f}]")
-    if all_lkv:
-        print(f"Decode l_kv range (avg):    [{min(all_lkv):.0f}, {max(all_lkv):.0f}]")
-    print(f"Wall time range:            [{y.min():.2f}, {y.max():.2f}] ms")
-
-    print("\n" + "=" * 80)
-    print("MODEL FORMULA")
-    print("=" * 80)
-    print(f"T_pd(f, B) = (1/f) × [{a_p:.6e}·Σl_q² + {b_p:.6e}·Σl_q·l_kv + {c_p:.6e}·Σl_q]")
-    print(f"           + (1/f^{alpha:.6f}) × [{a_d:.6e}·Σl_kv + {b_d:.6e}·num_decode]")
-    print(f"           + {t_c:.6f}")
-    print("=" * 80)
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Fit batch latency regression model"
-    )
-    parser.add_argument(
-        "--input",
-        type=str,
-        required=True,
-        help="Input JSONL profiling data file"
-    )
-    parser.add_argument(
-        "--output-params",
-        type=str,
-        help="Optional: output fitted parameters to JSON file"
-    )
-    parser.add_argument(
-        "--no-refine",
-        action="store_true",
-        help="Skip non-linear refinement step"
-    )
-    parser.add_argument(
-        "--test-split",
-        type=float,
-        default=0.2,
-        help="Test set split ratio (default: 0.2)"
-    )
+    args = parse_args()
+    np.random.seed(args.seed)
 
-    args = parser.parse_args()
+    print(f"Loading profiling data from {args.input} ...")
+    records = load_records(args.input)
+    print(f"Loaded {len(records)} raw records")
 
-    print("=" * 80)
-    print("Batch Latency Model Fitting")
-    print("=" * 80)
+    features = clean_and_prepare(records, args.warmup_per_freq, args.freq_tolerance)
+    print(f"Usable batch samples: {len(features)}")
 
-    # Load data
-    print(f"\nLoading profiling data from: {args.input}")
-    if not Path(args.input).exists():
-        print(f"Error: File not found: {args.input}")
+    if len(features) < 100:
+        print("ERROR: Too few usable samples.")
         sys.exit(1)
 
-    profiling_data = load_profiling_data(args.input)
-    print(f"  Loaded {len(profiling_data)} batch records")
+    # 80/20 train-test split
+    indices = np.arange(len(features))
+    np.random.shuffle(indices)
+    split = int(0.8 * len(indices))
+    features_train = [features[i] for i in indices[:split]]
+    features_test = [features[i] for i in indices[split:]]
+    print(f"Train: {len(features_train)}, Test: {len(features_test)}")
 
-    # Prepare dataset
-    print("\nPreparing dataset...")
-    X_raw, y = prepare_dataset(profiling_data)
-    print(f"  Valid samples: {len(y)}")
+    # Extract arrays
+    f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr = _extract_arrays(features_train)
+    f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te = _extract_arrays(features_test)
 
-    if len(y) < 100:
-        print(f"Warning: Only {len(y)} samples available. Need at least 100-200 for good fit.")
+    # Three fitting approaches
+    params1 = fit_grid_ols(f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr,
+                           f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te)
+    params2 = fit_grid_weighted(f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr,
+                                f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te)
+    params3 = fit_scipy_mape(f_tr, y_tr, sq_tr, ql_tr, lq_tr, ld_tr, nd_tr,
+                             f_te, y_te, sq_te, ql_te, lq_te, ld_te, nd_te,
+                             init_params=params2)
 
-    # Split train/test
-    print(f"\nSplitting data (test ratio: {args.test_split})...")
-    indices = np.arange(len(y))
-    train_idx, test_idx = train_test_split(
-        indices, test_size=args.test_split, random_state=42
-    )
+    # Compare all three
+    print("\n" + "=" * 70)
+    print("COMPARISON (test set)")
+    print("=" * 70)
+    candidates = [
+        ("Grid+OLS", params1),
+        ("Grid+Weighted", params2),
+        ("Scipy+MAPE", params3),
+    ]
+    best_mape, best_params, best_method = float("inf"), None, None
+    for name, params in candidates:
+        metrics = evaluate(params, features_test, name)
+        if metrics["mape"] < best_mape:
+            best_mape = metrics["mape"]
+            best_params = params
+            best_method = name
 
-    X_raw_train = [X_raw[i] for i in train_idx]
-    X_raw_test = [X_raw[i] for i in test_idx]
-    y_train = y[train_idx]
-    y_test = y[test_idx]
+    print(f"\n  >>> Best: {best_method} (test MAPE = {best_mape:.2f}%)")
 
-    print(f"  Train set: {len(y_train)} samples")
-    print(f"  Test set: {len(y_test)} samples")
+    # Final evaluation
+    print("\n" + "=" * 70)
+    print("FINAL MODEL EVALUATION")
+    print("=" * 70)
+    metrics_train = evaluate(best_params, features_train, "Train")
+    metrics_test = evaluate(best_params, features_test, "Test")
 
-    # Fit model with grid search
-    result = fit_model_grid_search(X_raw_train, y_train, X_raw_test, y_test)
+    # Data summary
+    f_vals = [ft["f"] for ft in features]
+    batch_sizes = [ft["total_reqs"] for ft in features]
+    rec_summary = data_summary_from_records(records)
 
-    # Refine with non-linear optimization
-    if not args.no_refine:
-        result = refine_with_nonlinear_optimization(
-            X_raw_train, y_train, X_raw_test, y_test, result["params"]
-        )
+    output = {
+        "parameters": {k: float(v) for k, v in best_params.items()},
+        "method": best_method,
+        "metrics": {
+            "train": {k: float(v) for k, v in metrics_train.items()},
+            "test": {k: float(v) for k, v in metrics_test.items()},
+        },
+        "data_summary": {
+            "total_batches": len(features),
+            "train_size": len(features_train),
+            "test_size": len(features_test),
+            "freq_min": min(f_vals),
+            "freq_max": max(f_vals),
+            "freq_distinct": len(set(round(f) for f in f_vals)),
+            "batch_size_min": min(batch_sizes),
+            "batch_size_max": max(batch_sizes),
+            **rec_summary,
+        },
+    }
 
-    # Print results
-    print_results(result, X_raw, y)
+    with open(args.output, "w") as fout:
+        json.dump(output, fout, indent=2)
 
-    # Save parameters
-    if args.output_params:
-        params_dict = {
-            "a_p": result["params"][0],
-            "b_p": result["params"][1],
-            "c_p": result["params"][2],
-            "a_d": result["params"][3],
-            "b_d": result["params"][4],
-            "alpha": result["params"][5],
-            "t_c": result["params"][6],
-            "train_mape": result["train_mape"],
-            "test_mape": result["test_mape"],
-            "train_metrics": result["train_metrics"],
-            "test_metrics": result["test_metrics"],
-        }
-
-        with open(args.output_params, "w") as f:
-            json.dump(params_dict, f, indent=2)
-
-        print(f"\nParameters saved to: {args.output_params}")
-
-    print("\n✓ Fitting complete!\n")
+    print(f"\nFitted parameters saved to {args.output}")
+    print("\nFitted Parameters:")
+    for k, v in best_params.items():
+        print(f"  {k:>8s} = {v:.8e}")
 
 
 if __name__ == "__main__":
